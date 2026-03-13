@@ -143,6 +143,8 @@ class LiveState:
     smooth_conf: float = 0.0
     smooth_bpm: float = 0.0
     bpm_buf: List[float] = field(default_factory=list)
+    smooth_sensor_bpm: float = 0.0
+    sensor_bpm_buf: List[float] = field(default_factory=list)
 
     # Rolling history for charts (max 120 points ≈ ~2 min at stride 10)
     bpm_history: List[Tuple[float, float, float]] = field(default_factory=list)  # (time, pred, sensor)
@@ -195,9 +197,20 @@ def serial_reader(
 
             if tag == "BPM" and len(parts) >= 5:
                 try:
-                    state.sensor_bpm = float(parts[2])
+                    raw_bpm = float(parts[2])
+                    state.sensor_bpm = raw_bpm
                     state.sensor_valid = int(parts[3])
                     state.bpm_count += 1
+                    # Smooth sensor BPM (median buffer + EMA) to reduce beat-to-beat fluctuation
+                    if state.sensor_valid and 30 < raw_bpm < 200:
+                        state.sensor_bpm_buf.append(raw_bpm)
+                        if len(state.sensor_bpm_buf) > 15:
+                            state.sensor_bpm_buf = state.sensor_bpm_buf[-15:]
+                        med = float(np.median(state.sensor_bpm_buf))
+                        if state.smooth_sensor_bpm < 30:
+                            state.smooth_sensor_bpm = med
+                        else:
+                            state.smooth_sensor_bpm += 0.15 * (med - state.smooth_sensor_bpm)
                 except ValueError:
                     pass
                 continue
@@ -330,6 +343,8 @@ def main() -> None:
         --green-dark: #43a047;
         --green-darker: #2e7d32;
         --green-light: rgba(76, 175, 80, 0.15);
+        --red: #ef4444;
+        --red-dark: #dc2626;
         --shadow: 0 1px 3px rgba(0,0,0,0.3);
         --shadow-lg: 0 4px 12px rgba(0,0,0,0.4);
     }
@@ -440,7 +455,7 @@ def main() -> None:
     .content-card {
         background: var(--surface);
         border-radius: 16px;
-        padding: 24px;
+        padding: 18px;
         box-shadow: var(--shadow);
         border: 1px solid var(--line);
     }
@@ -469,9 +484,41 @@ def main() -> None:
         border: 2px solid var(--green);
     }
 
-    .big-bpm { font-size: 80px; font-weight: 800; text-align: center; line-height: 1; margin: 0; }
-    .big-bpm-xl { font-size: 100px; font-weight: 800; text-align: center; line-height: 1; margin: 0; }
-    .bpm-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); text-align: center; margin-top: 8px; }
+    .bpm-hero-card { padding: 20px 22px 18px; }
+    .bpm-primary {
+        font-size: clamp(64px, 10vw, 150px);
+        font-weight: 850;
+        line-height: 0.95;
+        margin: 0;
+        text-align: center;
+        letter-spacing: -0.03em;
+    }
+    .bpm-primary-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: var(--muted);
+        text-align: center;
+        margin-top: 6px;
+        margin-bottom: 10px;
+    }
+    .bpm-secondary-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: center;
+        gap: 10px;
+    }
+    .bpm-secondary {
+        font-size: 64px;
+        font-weight: 750;
+        color: var(--red);
+    }
+    .bpm-secondary-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+    }
     .status-badge {
         padding: 8px 16px;
         border-radius: 999px;
@@ -487,7 +534,7 @@ def main() -> None:
         background: var(--surface-variant);
         border: 1px solid var(--line);
         border-radius: 12px;
-        padding: 12px 14px;
+        padding: 10px 12px;
     }
 
     /* Streamlit dark theme overrides */
@@ -509,11 +556,9 @@ def main() -> None:
 
         st.markdown('<div class="sidebar-section">MENU</div>', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-item active">📊 Dashboard</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-item">📁 Sessions</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sidebar-item">📈 Analytics</div>', unsafe_allow_html=True)
-
+ 
         st.markdown('<div class="sidebar-section">CONFIG</div>', unsafe_allow_html=True)
-        use_nickbild = st.toggle("Use Nickbild model (100-pkt)", value=False, help="Nickbild: simpler LSTM, 100 packets. Two-stage: classifier + regressor, 1600 packets.")
+        use_nickbild = st.toggle("Use Nickbild model (100-pkt)", value=True, help="Nickbild: simpler LSTM, 100 packets. Two-stage: classifier + regressor, 1600 packets.")
         port = st.text_input("Serial Port", value="/dev/cu.usbserial-0001")
         baud = st.number_input("Baud Rate", value=921600, step=1)
         clf_path = "models/phase1/stage_a_classifier.keras"
@@ -529,8 +574,8 @@ def main() -> None:
             stride = st.slider("Inference Stride", 1, 50, 10)
             threshold = st.slider("Detection Threshold", 0.0, 1.0, 0.3, 0.05)
 
-        start_btn = st.button("Start Session", use_container_width=True, type="primary")
-        stop_btn = st.button("Stop", use_container_width=True)
+        start_btn = st.button("Start Session", width="stretch", type="primary")
+        stop_btn = st.button("Stop", width="stretch")
 
         st.markdown("""
         <div class="sidebar-cta">
@@ -539,8 +584,10 @@ def main() -> None:
         </div>
         """, unsafe_allow_html=True)
 
-    # Initialize session state
+    # Initialize session state (migrate if schema changed)
     if "state" not in st.session_state:
+        st.session_state.state = LiveState()
+    elif not hasattr(st.session_state.state, "smooth_sensor_bpm"):
         st.session_state.state = LiveState()
     if "thread" not in st.session_state:
         st.session_state.thread = None
@@ -582,100 +629,76 @@ def main() -> None:
     if stop_btn:
         state.connected = False
         state.model_type = ""
+        state.sensor_bpm_buf.clear()
+        state.smooth_sensor_bpm = 0.0
 
     # ── Main Display ──
     sensor_ok = bool(state.sensor_valid and state.sensor_bpm > 0)
 
-    # Header
-    header_col1, header_col2 = st.columns([3, 1])
-    with header_col1:
-        st.markdown('<div class="header-title">Dashboard</div>', unsafe_allow_html=True)
-        st.markdown('<div class="header-sub">Monitor live CSI heart rate signals in real time.</div>', unsafe_allow_html=True)
+    # Header (compact)
+    st.markdown('<div class="header-title">Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="header-sub">Monitor live CSI heart rate signals in real time.</div>', unsafe_allow_html=True)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # Summary cards — Donezo-style (one primary green)
-    model_label = state.model_type or ("nickbild" if use_nickbild else "two_stage")
-    model_label = model_label.replace("_", " ").title() if model_label else ""
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        status = "Human" if state.detected_human and state.connected else "Stable"
-        sub = f"{state.rx_status} · {model_label}" if state.connected else state.rx_status
-        st.markdown(
-            f'<div class="stat-card primary"><span class="arrow-up">▲</span>'
-            f'<div class="stat-value">{status}</div>'
-            f'<div class="stat-sub">{sub}</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            f'<div class="stat-card"><span class="arrow-up">▲</span>'
-            f'<div class="stat-value">{state.smooth_conf:.0%}</div>'
-            f'<div class="stat-sub">Confidence</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            f'<div class="stat-card"><span class="arrow-up">▲</span>'
-            f'<div class="stat-value">{state.csi_count:,}</div>'
-            f'<div class="stat-sub">CSI Packets</div></div>',
-            unsafe_allow_html=True,
-        )
-    with c4:
-        sensor_disp = f"{state.sensor_bpm:.0f}" if sensor_ok else "-"
-        st.markdown(
-            f'<div class="stat-card"><span class="arrow-up">▲</span>'
-            f'<div class="stat-value">{sensor_disp}</div>'
-            f'<div class="stat-sub">Sensor BPM</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-
-    # Main content row
-    row_left, row_right = st.columns([1.5, 1])
+    # Main content row: BPM hero + side stats (so charts fit below)
+    row_left, row_right = st.columns([2.3, 0.9], gap="small")
     with row_left:
-        st.markdown('<div class="content-card">', unsafe_allow_html=True)
         if state.detected_human and state.smooth_bpm > 30:
             bpm_display = f"{state.smooth_bpm:.0f}"
             bpm_color = "var(--green-dark)"
         else:
             bpm_display = "—"
             bpm_color = "var(--muted)"
-        pred_class = "big-bpm" if sensor_ok else "big-bpm-xl"
-        st.markdown(
-            f'<p class="{pred_class}" style="color:{bpm_color}">{bpm_display}</p>',
-            unsafe_allow_html=True,
+        sensor_val_disp = state.smooth_sensor_bpm if state.smooth_sensor_bpm > 30 else state.sensor_bpm
+        sensor_display = f"{sensor_val_disp:.0f}" if sensor_ok else "—"
+        st.html(
+            f'<div class="content-card bpm-hero-card">'
+            f'<p class="bpm-primary" style="color:{bpm_color}">{bpm_display}</p>'
+            f'<p class="bpm-primary-label">Predicted BPM (CSI)</p>'
+            f'<p class="bpm-primary" style="color:red">{sensor_display}</p>'
+            f'<p class="bpm-primary-label">Sensor (MAX30102))</p>'
+            f'</div>'
         )
-        st.markdown('<p class="bpm-label">Predicted BPM (CSI)</p>', unsafe_allow_html=True)
-        sensor_display = f"{state.sensor_bpm:.0f}" if sensor_ok else "-"
-        st.markdown(
-            f'<p class="big-bpm" style="font-size:42px;color:var(--green-dark)">{sensor_display}</p>',
-            unsafe_allow_html=True,
-        )
-        st.markdown('<p class="bpm-label">Sensor BPM (MAX30102)</p>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
     with row_right:
-        st.markdown('<div class="content-card">', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:12px;color:var(--muted);margin-bottom:12px;font-weight:600">DETECTION</div>', unsafe_allow_html=True)
-        if state.detected_human and state.connected:
-            st.markdown('<p class="status-badge human">HUMAN DETECTED</p>', unsafe_allow_html=True)
-        elif state.connected:
-            st.markdown('<p class="status-badge stable">STABLE</p>', unsafe_allow_html=True)
-        else:
-            st.markdown('<p class="status-badge disconnected">NOT CONNECTED</p>', unsafe_allow_html=True)
-        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-        st.metric("Confidence", f"{state.smooth_conf:.1%}")
-        st.metric("Sensor Valid", "Yes" if state.sensor_valid else "No")
-        st.metric("BPM Readings", f"{state.bpm_count:,}")
-        st.markdown('</div>', unsafe_allow_html=True)
+        model_label = state.model_type or ("nickbild" if use_nickbild else "two_stage")
+        model_label = model_label.replace("_", " ").title() if model_label else ""
+        status = "Human" if state.detected_human and state.connected else ("Stable" if state.connected else "Not Connected")
+        badge_class = "human" if status == "Human" else ("stable" if status == "Stable" else "disconnected")
+        conf_display = f"{state.smooth_conf:.1%}"
+        csi_display = f"{state.csi_count:,}"
+        sensor_valid_display = "Yes" if state.sensor_valid else "No"
+        st.html(
+            f"""
+            <div class="content-card">
+              <div style="font-size:12px;color:var(--muted);margin-bottom:10px;font-weight:600">STATUS</div>
+              <p class="status-badge {badge_class}">{status.upper()}</p>
+              <div style="font-size:11px;color:var(--muted);margin-top:6px">{state.rx_status} · {model_label}</div>
+              <div style="height:12px"></div>
+              <div style="display:grid;grid-template-columns:1fr;gap:10px">
+                <div style="background:var(--surface-variant);border:1px solid var(--line);border-radius:12px;padding:10px 12px">
+                  <div style="font-size:12px;color:var(--muted);font-weight:600">Confidence</div>
+                  <div style="font-size:18px;font-weight:800;color:var(--ink);margin-top:2px">{conf_display}</div>
+                </div>
+                <div style="background:var(--surface-variant);border:1px solid var(--line);border-radius:12px;padding:10px 12px">
+                  <div style="font-size:12px;color:var(--muted);font-weight:600">CSI Packets</div>
+                  <div style="font-size:18px;font-weight:800;color:var(--ink);margin-top:2px">{csi_display}</div>
+                </div>
+                <div style="background:var(--surface-variant);border:1px solid var(--line);border-radius:12px;padding:10px 12px">
+                  <div style="font-size:12px;color:var(--muted);font-weight:600">Sensor Valid</div>
+                  <div style="font-size:18px;font-weight:800;color:var(--ink);margin-top:2px">{sensor_valid_display}</div>
+                </div>
+              </div>
+            </div>
+            """
+        )
 
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
     # Charts
     chart_col1, chart_col2 = st.columns(2)
 
     with chart_col1:
-        st.markdown('<div class="content-card">', unsafe_allow_html=True)
         st.markdown('<div style="font-size:14px;font-weight:700;margin-bottom:12px">BPM Over Time</div>', unsafe_allow_html=True)
         if state.bpm_history:
             times = [h[0] for h in state.bpm_history]
@@ -692,28 +715,34 @@ def main() -> None:
             fig.add_trace(go.Scatter(
                 x=times, y=sensors, mode="lines+markers",
                 name="Sensor (MAX30102)",
-                line=dict(color="#22c55e", width=2.5),
+                line=dict(color="#ef4444", width=2.5),
                 marker=dict(size=5),
             ))
             fig.update_layout(
-                xaxis_title="Time (s)",
-                yaxis_title="BPM",
+                xaxis_title="",
+                yaxis_title="",
                 yaxis=dict(range=[40, 180], gridcolor="rgba(255,255,255,0.1)", tickfont=dict(color="#e1e1e1")),
                 xaxis=dict(gridcolor="rgba(255,255,255,0.1)", tickfont=dict(color="#e1e1e1")),
-                height=320,
-                margin=dict(l=20, r=20, t=10, b=40),
-                legend=dict(orientation="h", y=-0.15, font=dict(color="#e1e1e1")),
+                height=240,
+                margin=dict(l=16, r=16, t=6, b=26),
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="left",
+                    x=0,
+                    font=dict(color="#e1e1e1"),
+                ),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(family="Inter, sans-serif", color="#e1e1e1"),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.info("Waiting for data...")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with chart_col2:
-        st.markdown('<div class="content-card">', unsafe_allow_html=True)
         st.markdown('<div style="font-size:14px;font-weight:700;margin-bottom:12px">Detection Confidence</div>', unsafe_allow_html=True)
         if state.prob_history:
             times = [h[0] for h in state.prob_history]
@@ -729,17 +758,17 @@ def main() -> None:
             fig2.add_hline(y=threshold, line_dash="dash",
                           line_color="#9e9e9e", annotation_text="Threshold")
             fig2.update_layout(
-                xaxis_title="Time (s)",
-                yaxis_title="Confidence",
+                xaxis_title="",
+                yaxis_title="",
                 yaxis=dict(range=[0, 1], gridcolor="rgba(255,255,255,0.1)", tickfont=dict(color="#e1e1e1")),
                 xaxis=dict(gridcolor="rgba(255,255,255,0.1)", tickfont=dict(color="#e1e1e1")),
-                height=320,
-                margin=dict(l=20, r=20, t=10, b=40),
+                height=240,
+                margin=dict(l=16, r=16, t=6, b=26),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(family="Inter, sans-serif", color="#e1e1e1"),
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
         else:
             st.info("Waiting for data...")
         st.markdown('</div>', unsafe_allow_html=True)
