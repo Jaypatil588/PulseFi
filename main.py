@@ -378,6 +378,23 @@ def step_merge() -> None:
     print_check(validate_training_csv(output))
 
 
+def step_train_nickbild() -> None:
+    """Train nickbild/csi_hr-style LSTM (100 packets, 64 subcarriers)."""
+    data_root = Path(prompt("Data root", str(DATA_ROOT)))
+    outdir = Path(prompt("Model output dir", str(MODELS_ROOT / "nickbild")))
+    run_cmd(
+        [
+            PYTHON_311,
+            str(PIPELINE_DIR / "train_nickbild.py"),
+            "--data-root", str(data_root),
+            "--outdir", str(outdir),
+            "--epochs", "100",
+            "--batch-size", "32",
+        ]
+    )
+    print(f"Model saved to {outdir / 'csi_hr.keras'}")
+
+
 def step_train() -> None:
     training_csv = Path(prompt("Training CSV", str(DATA_ROOT / "all_training_main.csv")))
     outdir = Path(prompt("Model output dir", str(MODELS_ROOT)))
@@ -512,9 +529,10 @@ MENU = {
     "6": ("Merge training CSVs", step_merge),
     "7": ("Train two-stage models", step_train),
     "8": ("Test models", step_test),
-    "9": ("Run live inference", step_live),
-    "10": ("Run dashboard UI", step_dashboard),
-    "11": ("Run full offline pipeline", step_full_pipeline),
+    "9": ("Train nickbild-style model (100-pkt LSTM)", step_train_nickbild),
+    "10": ("Run live inference", step_live),
+    "11": ("Run dashboard UI", step_dashboard),
+    "12": ("Run full offline pipeline", step_full_pipeline),
 }
 
 

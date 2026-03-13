@@ -25,7 +25,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy.signal import butter, filtfilt, savgol_filter
 
-WINDOW_SIZE = 1600
+WINDOW_SIZE_TWO_STAGE = 1600
+WINDOW_SIZE_NICKBILD = 100
 SC_COUNT = 64
 
 
@@ -122,6 +123,7 @@ class LiveState:
     # Serial connection
     connected: bool = False
     rx_status: str = "Disconnected"
+    model_type: str = ""  # "nickbild" or "two_stage" when running
     csi_count: int = 0
     bpm_count: int = 0
 
@@ -152,15 +154,18 @@ def serial_reader(
     state: LiveState,
     port: str,
     baud: int,
+    use_nickbild: bool,
     clf,
     reg,
+    nickbild_model,
     stride: int,
     threshold: float,
 ) -> None:
     """Background thread: reads serial, runs inference, updates state."""
     import serial as ser_mod
 
-    csi_buf: Deque[Tuple[int, np.ndarray]] = deque(maxlen=WINDOW_SIZE)
+    window_size = WINDOW_SIZE_NICKBILD if use_nickbild else WINDOW_SIZE_TWO_STAGE
+    csi_buf: Deque[Tuple[int, np.ndarray]] = deque(maxlen=window_size)
     csi_counter = 0
     start_time = time.time()
 
@@ -212,7 +217,7 @@ def serial_reader(
             csi_counter += 1
             state.csi_count = csi_counter
 
-            if len(csi_buf) < WINDOW_SIZE or csi_counter % stride != 0:
+            if len(csi_buf) < window_size or csi_counter % stride != 0:
                 continue
 
             # Run inference
@@ -224,35 +229,43 @@ def serial_reader(
                 fs = float(np.clip(1.0 / np.median(dt), 20.0, 200.0)) if len(dt) > 0 else 80.0
 
                 feat = process_window(amp_window, fs=fs)
-                x_in = feat.reshape(1, WINDOW_SIZE, SC_COUNT)
+                x_in = feat.reshape(1, window_size, SC_COUNT)
 
-                # ML inference (optional classifier, regressor always on)
-                prob = 0.0
-                if clf is not None:
-                    pvec = compute_periodicity_vector(feat, fs)
-                    p_in = pvec.reshape(1, SC_COUNT)
-                    prob = float(clf.predict([x_in, p_in], verbose=0)[0, 0])
-                pred_bpm_ml = float(reg.predict(x_in, verbose=0)[0, 0]) * 100.0
+                if use_nickbild:
+                    pred_bpm_ml = float(nickbild_model.predict(x_in, verbose=0)[0, 0])
+                    prob = 1.0
+                    detected = True
+                else:
+                    prob = 0.0
+                    if clf is not None:
+                        pvec = compute_periodicity_vector(feat, fs)
+                        p_in = pvec.reshape(1, SC_COUNT)
+                        prob = float(clf.predict([x_in, p_in], verbose=0)[0, 0])
+                    pred_bpm_ml = float(reg.predict(x_in, verbose=0)[0, 0]) * 100.0
+                    if state.detected_human:
+                        detected = state.smooth_conf >= threshold * 0.5
+                    else:
+                        detected = state.smooth_conf >= threshold
             except Exception as e:
                 state.rx_status = f"Inference error: {e}"
                 continue
 
-            # ── Smooth confidence (EMA) + hysteresis ──
+            # ── Smooth confidence (EMA) + hysteresis (two-stage only) ──
             EMA_CONF = 0.3
             EMA_BPM = 0.15
             BPM_BUF_SIZE = 15
 
-            if clf is not None:
+            if not use_nickbild and clf is not None:
                 if state.smooth_conf < 1e-6:
                     state.smooth_conf = prob
                 else:
                     state.smooth_conf += EMA_CONF * (prob - state.smooth_conf)
-            if state.detected_human:
-                detected = state.smooth_conf >= threshold * 0.5
+                state.pred_class = 1 if detected else 0
+                state.human_prob = float(state.smooth_conf)
             else:
-                detected = state.smooth_conf >= threshold
-            state.pred_class = 1 if detected else 0
-            state.human_prob = float(state.smooth_conf)
+                state.smooth_conf = 1.0
+                state.pred_class = 1
+                state.human_prob = 1.0
 
             # ── Smooth BPM (median buffer rejects outliers, then EMA) ──
             if 30 < pred_bpm_ml < 200:
@@ -265,19 +278,19 @@ def serial_reader(
                 else:
                     state.smooth_bpm += EMA_BPM * (med_bpm - state.smooth_bpm)
 
-            display_bpm = state.smooth_bpm if detected and state.smooth_bpm > 30 else 0.0
+            display_bpm = state.smooth_bpm if (detected or use_nickbild) and state.smooth_bpm > 30 else 0.0
 
             now = time.time() - start_time
 
             state.pred_bpm = display_bpm
             state.spectral_bpm = pred_bpm_ml
             state.spectral_conf = prob
-            state.detected_human = detected
+            state.detected_human = detected or use_nickbild
             state.last_infer_time = now
 
             # Update history
             sensor_val = state.sensor_bpm if state.sensor_valid else 0.0
-            state.bpm_history.append((now, display_bpm if detected else float("nan"), sensor_val))
+            state.bpm_history.append((now, display_bpm if (detected or use_nickbild) else float("nan"), sensor_val))
             state.prob_history.append((now, state.smooth_conf))
             if len(state.bpm_history) > state.max_history:
                 state.bpm_history = state.bpm_history[-state.max_history:]
@@ -500,12 +513,21 @@ def main() -> None:
         st.markdown('<div class="sidebar-item">📈 Analytics</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="sidebar-section">CONFIG</div>', unsafe_allow_html=True)
+        use_nickbild = st.toggle("Use Nickbild model (100-pkt)", value=False, help="Nickbild: simpler LSTM, 100 packets. Two-stage: classifier + regressor, 1600 packets.")
         port = st.text_input("Serial Port", value="/dev/cu.usbserial-0001")
         baud = st.number_input("Baud Rate", value=921600, step=1)
-        clf_path = st.text_input("Classifier Model", value="models/phase1/stage_a_classifier.keras")
-        reg_path = st.text_input("Regressor Model", value="models/phase1/stage_b_regressor.keras")
-        stride = st.slider("Inference Stride", 1, 50, 10)
-        threshold = st.slider("Detection Threshold", 0.0, 1.0, 0.3, 0.05)
+        clf_path = "models/phase1/stage_a_classifier.keras"
+        reg_path = "models/phase1/stage_b_regressor.keras"
+        nickbild_path = "models/nickbild/csi_hr.keras"
+        if use_nickbild:
+            nickbild_path = st.text_input("Nickbild Model", value=nickbild_path)
+            stride = st.slider("Inference Stride", 1, 20, 5, help="Nickbild: every N packets (100-pkt window)")
+            threshold = 0.5
+        else:
+            clf_path = st.text_input("Classifier Model", value=clf_path)
+            reg_path = st.text_input("Regressor Model", value=reg_path)
+            stride = st.slider("Inference Stride", 1, 50, 10)
+            threshold = st.slider("Detection Threshold", 0.0, 1.0, 0.3, 0.05)
 
         start_btn = st.button("Start Session", use_container_width=True, type="primary")
         stop_btn = st.button("Stop", use_container_width=True)
@@ -528,8 +550,15 @@ def main() -> None:
     # Start/Stop logic
     if start_btn and not state.connected:
         from tensorflow import keras
-        clf = keras.models.load_model(clf_path, safe_mode=False)
-        reg = keras.models.load_model(reg_path, safe_mode=False)
+        if use_nickbild:
+            nickbild_model = keras.models.load_model(nickbild_path, safe_mode=False)
+            clf, reg = None, None
+            state.model_type = "nickbild"
+        else:
+            clf = keras.models.load_model(clf_path, safe_mode=False)
+            reg = keras.models.load_model(reg_path, safe_mode=False)
+            nickbild_model = None
+            state.model_type = "two_stage"
         state.connected = True
         state.rx_status = "Connecting..."
         t = threading.Thread(
@@ -538,8 +567,10 @@ def main() -> None:
                 state,
                 port,
                 baud,
+                use_nickbild,
                 clf,
                 reg,
+                nickbild_model,
                 stride,
                 threshold,
             ),
@@ -550,6 +581,7 @@ def main() -> None:
 
     if stop_btn:
         state.connected = False
+        state.model_type = ""
 
     # ── Main Display ──
     sensor_ok = bool(state.sensor_valid and state.sensor_bpm > 0)
@@ -561,13 +593,16 @@ def main() -> None:
         st.markdown('<div class="header-sub">Monitor live CSI heart rate signals in real time.</div>', unsafe_allow_html=True)
 
     # Summary cards — Donezo-style (one primary green)
+    model_label = state.model_type or ("nickbild" if use_nickbild else "two_stage")
+    model_label = model_label.replace("_", " ").title() if model_label else ""
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         status = "Human" if state.detected_human and state.connected else "Stable"
+        sub = f"{state.rx_status} · {model_label}" if state.connected else state.rx_status
         st.markdown(
             f'<div class="stat-card primary"><span class="arrow-up">▲</span>'
             f'<div class="stat-value">{status}</div>'
-            f'<div class="stat-sub">{state.rx_status}</div></div>',
+            f'<div class="stat-sub">{sub}</div></div>',
             unsafe_allow_html=True,
         )
     with c2:
