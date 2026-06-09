@@ -26,6 +26,7 @@ PulseFi is a hardware-first heartbeat and human-presence detection system that e
 2. Build training CSV windows with feature extraction.
 3. Train two-stage models (presence + BPM regression).
 4. Run live inference from serial CSI stream and display predictions.
+<img width="1909" height="1018" alt="Screenshot 2026-03-12 at 7 23 06 PM" src="https://github.com/user-attachments/assets/51d1a854-3104-4362-8460-c61bcce3e198" />
 
 ## Quick Start
 
@@ -41,3 +42,6 @@ Then use the interactive menu to run pipeline steps and validation.
 - Live inference expects CSI lines in this format:
   - `CSI_PKT,rx_ts_us,seq,rssi,csi_len,amp_sc00..amp_sc63`
   - `BPM,rx_ts_us,bpm_value,bpm_valid,sensor_age_ms`
+ 
+[PulseFi_Slide_Deck.pptx](https://github.com/user-attachments/files/28743461/PulseFi_Slide_Deck.pptx)
+
