@@ -520,6 +520,18 @@ def step_full_pipeline() -> None:
     step_train()
 
 
+def step_heartbeat_worker() -> None:
+    print("\n  LLM heartbeat agent:")
+    print("    1. Follow live predictions (requires OPENAI_API_KEY)")
+    print("    2. Run offline plumbing test (fake client, no API)")
+    choice = prompt("Choice", "1")
+    if choice == "1":
+        csv_path = prompt("Predictions CSV", str(RUNTIME_ROOT / "live_predictions.csv"))
+        run_cmd([PYTHON_311, "-m", "agentic.worker", "--csv", csv_path])
+        return
+    run_cmd([PYTHON_311, "-m", "agentic.harness"])
+
+
 MENU = {
     "1": ("Capture raw session", step_capture),
     "2": ("Validate raw session", step_validate_raw),
@@ -533,6 +545,7 @@ MENU = {
     "10": ("Run live inference", step_live),
     "11": ("Run dashboard UI", step_dashboard),
     "12": ("Run full offline pipeline", step_full_pipeline),
+    "13": ("Run heartbeat worker", step_heartbeat_worker),
 }
 
 
