@@ -1,39 +1,69 @@
 # PulseFi heartbeat agent
 
-This worker continuously tails `runtime/live_predictions.csv`. For every new
-LSTM inference row, it sends a bounded context to an OpenAI-compatible model
-and stores the validated response and memories in SQLite.
+The worker continuously tails `runtime/live_predictions.csv`. Each row goes
+through the deterministic guard in `policy.py`. The real configured Groq model
+runs on alert transitions and a bounded periodic cadence. A deterministic merge
+keeps the guard as a severity floor, so Groq may escalate but cannot downgrade
+it. Groq also supplies trend, forecast, evidence, feedback, suggestion, and
+memory.
 
-It does not run without credentials:
+Run the worker:
 
 ```bash
-export OPENAI_API_KEY="your-new-key"
-export PULSEFI_AGENT_MODEL="gpt-4o-mini"
 python -m agentic worker
 ```
 
-Optional:
+If `GROQ_API_KEY` is absent, the worker remains active in visibly labeled
+`deterministic-guard-only` mode. It never fabricates an LLM response.
+
+Without ESP32 hardware, start that worker with an honest source label:
 
 ```bash
-export PULSEFI_AGENT_BASE_URL="https://api.openai.com/v1"
-python -m agentic worker \
-  --csv runtime/live_predictions.csv \
-  --db runtime/pulsefi_agent.db
+python -m agentic worker --source generated_stream
 ```
 
-The offline harness does not call an external model:
+Then write schema-accurate input in another terminal:
 
 ```bash
-python -m agentic harness
+python -m agentic stream
 ```
 
-Database memories:
+The generator replaces only unavailable ESP32/LSTM input. It never creates
+agent responses, memories, episodes, or alerts.
 
-- `observations`: bounded context source (working memory)
-- `episodes`: periods the model labels `watch` or `urgent` (episodic memory)
-- `semantic_memory`: the latest model-generated memory summary
-- `procedural_memory`: the fixed agent-loop procedure
-- `model_memory`: metadata describing the upstream LSTM as parametric memory
-- `decisions`: predictions, feedback, suggestions, confidence, and model name
+Open the persisted-state dashboard:
+
+```bash
+streamlit run agentic/dashboard.py
+```
+
+SQLite stores:
+
+- `observations`: bounded working memory
+- `features`: deterministic guard inputs and evidence
+- `episodes`: open, escalated, recovering, and resolved events
+- `semantic_memory`: personal baseline/profile and latest agent memory
+- `procedural_memory`: the fixed guarded loop procedure
+- `model_memory`: the upstream LSTM as parametric memory
+- `decisions`: LLM and final states, output, usage, and API identity
+- `actions`: durable in-app messages and acknowledgement
+- `integration_outbox`: future MCP/export events, not a claimed integration
+- `delivery_attempts`: real optional transport attempts and retry outcomes
+- `stream_events`: redacted malformed-row and incompatible-schema records
+- `traces`: latency, tokens, states, outcome, confidence, and errors
+
+Groq configuration is loaded from `.env` or the process environment:
+
+```dotenv
+GROQ_API_KEY=replace-with-your-key
+PULSEFI_AGENT_MODEL=openai/gpt-oss-120b
+PULSEFI_AGENT_BASE_URL=https://api.groq.com/openai/v1
+PULSEFI_LLM_INTERVAL_SECONDS=30
+PULSEFI_ALERT_EXPORT_JSONL=
+```
+
+Set `PULSEFI_ALERT_EXPORT_JSONL` to a path to activate durable local JSONL
+delivery with bounded exponential retries. Leave it blank to retain events as
+pending future-integration wiring.
 
 This is a research prototype and not a medical device.

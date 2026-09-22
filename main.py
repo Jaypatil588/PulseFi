@@ -522,14 +522,41 @@ def step_full_pipeline() -> None:
 
 def step_heartbeat_worker() -> None:
     print("\n  LLM heartbeat agent:")
-    print("    1. Follow live predictions (requires OPENAI_API_KEY)")
-    print("    2. Run offline plumbing test (fake client, no API)")
-    choice = prompt("Choice", "1")
-    if choice == "1":
-        csv_path = prompt("Predictions CSV", str(RUNTIME_ROOT / "live_predictions.csv"))
-        run_cmd([PYTHON_311, "-m", "agentic.worker", "--csv", csv_path])
-        return
-    run_cmd([PYTHON_311, "-m", "agentic.harness"])
+    print("    Follow live predictions (Groq optional; guard always active)")
+    csv_path = prompt("Predictions CSV", str(RUNTIME_ROOT / "live_predictions.csv"))
+    source = prompt(
+        "Input source (lstm_live/generated_stream/recorded_replay)",
+        "lstm_live",
+    )
+    run_cmd(
+        [
+            PYTHON_311,
+            "-m",
+            "agentic.worker",
+            "--csv",
+            csv_path,
+            "--source",
+            source,
+        ]
+    )
+
+
+def step_agent_input_stream() -> None:
+    print("\n  Generated prediction input stream:")
+    print("    This replaces unavailable ESP32/LSTM input only.")
+    run_cmd([PYTHON_311, "-m", "agentic.stream_generator"])
+
+
+def step_agent_dashboard() -> None:
+    run_cmd(
+        [
+            PYTHON_311,
+            "-m",
+            "streamlit",
+            "run",
+            "agentic/dashboard.py",
+        ]
+    )
 
 
 MENU = {
@@ -546,6 +573,8 @@ MENU = {
     "11": ("Run dashboard UI", step_dashboard),
     "12": ("Run full offline pipeline", step_full_pipeline),
     "13": ("Run heartbeat worker", step_heartbeat_worker),
+    "14": ("Generate agent input stream", step_agent_input_stream),
+    "15": ("Run agent dashboard", step_agent_dashboard),
 }
 
 

@@ -1,9 +1,10 @@
-"""Small OpenAI-compatible client used by the heartbeat agent."""
+"""Groq client used by the heartbeat agent."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -16,69 +17,225 @@ class AgentClientError(RuntimeError):
 
 @dataclass(frozen=True)
 class AgentDecision:
-    status: str
+    state: str
     trend: str
-    prediction: str
+    forecast: str
+    evidence: tuple[str, ...]
     feedback: str
     suggestion: str
     confidence: float
-    memory_summary: str
+    memory_update: str
 
     @classmethod
     def from_dict(cls, value: dict) -> "AgentDecision":
         required = (
-            "status",
+            "state",
             "trend",
-            "prediction",
+            "forecast",
+            "evidence",
             "feedback",
             "suggestion",
             "confidence",
-            "memory_summary",
+            "memory_update",
         )
         missing = [key for key in required if key not in value]
         if missing:
             raise AgentClientError(f"Model response missing: {', '.join(missing)}")
-        status = str(value["status"])
-        if status not in {"no_person", "normal", "watch", "urgent"}:
-            raise AgentClientError(f"Invalid status: {status}")
+        extra = sorted(set(value) - set(required))
+        if extra:
+            raise AgentClientError(
+                f"Model response contains unsupported fields: {', '.join(extra)}"
+            )
+        state = str(value["state"])
+        if state not in {
+            "no_person",
+            "normal",
+            "recovering",
+            "watch",
+            "urgent",
+        }:
+            raise AgentClientError(f"Invalid state: {state}")
         confidence = float(value["confidence"])
         if not 0.0 <= confidence <= 1.0:
             raise AgentClientError("confidence must be between 0 and 1")
-        return cls(
-            status=status,
+        evidence_value = value["evidence"]
+        if not isinstance(evidence_value, list) or not 1 <= len(evidence_value) <= 8:
+            raise AgentClientError("evidence must contain 1 to 8 strings")
+        evidence = tuple(str(item)[:300] for item in evidence_value)
+        decision = cls(
+            state=state,
             trend=str(value["trend"])[:80],
-            prediction=str(value["prediction"])[:500],
+            forecast=str(value["forecast"])[:500],
+            evidence=evidence,
             feedback=str(value["feedback"])[:500],
             suggestion=str(value["suggestion"])[:500],
             confidence=confidence,
-            memory_summary=str(value["memory_summary"])[:500],
+            memory_update=str(value["memory_update"])[:500],
         )
+        _validate_safe_language(decision)
+        return decision
+
+    @property
+    def status(self) -> str:
+        return self.state
+
+    @property
+    def prediction(self) -> str:
+        return self.forecast
+
+    @property
+    def memory_summary(self) -> str:
+        return self.memory_update
+
+
+@dataclass(frozen=True)
+class AgentUsage:
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    queue_time_s: float | None
+    total_time_s: float | None
+
+
+@dataclass(frozen=True)
+class AgentResponse:
+    decision: AgentDecision
+    usage: AgentUsage
+    request_id: str | None
+    system_fingerprint: str | None
+    reasoning_available: bool = True
+    reasoning_status: str = "success"
+    error: str | None = None
 
 
 class AgentClient(Protocol):
-    def analyze(self, context: dict) -> AgentDecision: ...
+    def analyze(self, context: dict) -> AgentResponse: ...
 
 
-SYSTEM_PROMPT = """You are the PulseFi heartbeat monitoring agent.
-You receive WiFi-LSTM heart-rate estimates, presence confidence, recent
-readings, past episodes, and learned user facts.
+UNSAFE_LANGUAGE = (
+    re.compile(
+        r"\byou (?:have|are having|are experiencing) "
+        r"(?:a |an )?(?:heart attack|arrhythmia|disease|condition)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:stop|start|increase|decrease|double|skip) "
+        r"(?:taking )?(?:your )?(?:medication|medicine|dose)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:guaranteed|definitely safe)\b", re.IGNORECASE),
+)
 
-Analyze the trend and provide cautious wellness feedback. This research
-prototype is not a medical device. Never diagnose a disease, promise an
-outcome, or claim a medical emergency from these readings. If a sustained
-reading looks concerning, advise the user to stop activity, recheck with a
-validated device, and seek professional or emergency help only when symptoms
-or immediate danger are present.
 
-Return only a JSON object with exactly these fields:
-status: one of no_person, normal, watch, urgent
-trend: short description
-prediction: what the next few readings may do, explicitly uncertain
-feedback: concise interpretation
-suggestion: one concrete, cautious action
-confidence: number from 0 to 1
-memory_summary: one sentence worth remembering for later ticks
+def _validate_safe_language(decision: AgentDecision) -> None:
+    text = " ".join(
+        (
+            decision.trend,
+            decision.forecast,
+            *decision.evidence,
+            decision.feedback,
+            decision.suggestion,
+            decision.memory_update,
+        )
+    )
+    for pattern in UNSAFE_LANGUAGE:
+        if pattern.search(text):
+            raise AgentClientError(
+                "Model response failed the deterministic safety-language check"
+            )
+
+
+def _validate_grounded_evidence(
+    decision: AgentDecision, context: dict
+) -> None:
+    evidence = " ".join(decision.evidence).lower()
+    current = context.get("current_reading") or {}
+    unsupported = {
+        "spo2": ("spo2", "oxygen saturation"),
+        "blood_pressure": ("blood pressure", "systolic", "diastolic"),
+        "ecg": ("ecg", "electrocardiogram"),
+    }
+    for field, terms in unsupported.items():
+        if current.get(field) is None and any(term in evidence for term in terms):
+            raise AgentClientError(
+                f"Model evidence cites unavailable measurement: {field}"
+            )
+    reported_symptoms = set(current.get("symptoms") or ())
+    for symptom in (
+        "chest pain",
+        "fainting",
+        "shortness of breath",
+        "dizziness",
+        "palpitations",
+    ):
+        if symptom in evidence and symptom not in reported_symptoms:
+            raise AgentClientError(
+                f"Model evidence invents an unreported symptom: {symptom}"
+            )
+
+
+SYSTEM_PROMPT = """You are the reasoning component of PulseFi, a research
+heartbeat-monitoring system. A deterministic measurement guard runs separately
+and is authoritative. You receive its result, experimental WiFi-LSTM presence
+and BPM estimates, recent readings, active/recent episodes, a personal profile,
+and procedural memory.
+
+Interpret only the supplied evidence. Do not invent symptoms, measurements,
+diagnoses, or medical history. Never diagnose a disease, guarantee safety,
+promise an outcome, recommend changing medication, or claim an emergency from
+the device reading alone. Clearly state uncertainty. If evidence is concerning,
+recommend stopping activity and verifying with a validated device. Emergency
+guidance is conditional on serious symptoms or the explicit deterministic
+policy included in context.
+
+Return only the requested JSON schema. The application deterministically merges
+your state with the measurement guard; you cannot downgrade a guard-raised
+state.
 """
+
+
+DECISION_SCHEMA = {
+    "name": "pulsefi_agent_decision",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "state": {
+                "type": "string",
+                "enum": [
+                    "no_person",
+                    "normal",
+                    "recovering",
+                    "watch",
+                    "urgent",
+                ],
+            },
+            "trend": {"type": "string"},
+            "forecast": {"type": "string"},
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 8,
+            },
+            "feedback": {"type": "string"},
+            "suggestion": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "memory_update": {"type": "string"},
+        },
+        "required": [
+            "state",
+            "trend",
+            "forecast",
+            "evidence",
+            "feedback",
+            "suggestion",
+            "confidence",
+            "memory_update",
+        ],
+    },
+}
 
 
 def _extract_json(text: str) -> dict:
@@ -95,38 +252,58 @@ def _extract_json(text: str) -> dict:
     return value
 
 
-class OpenAICompatibleClient:
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _optional_string(value) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+class GroqClient:
     def __init__(
         self,
         api_key: str,
         model: str,
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str = "https://api.groq.com/openai/v1",
         timeout_s: float = 30.0,
     ):
         if not api_key:
-            raise AgentClientError("OPENAI_API_KEY is required")
+            raise AgentClientError("GROQ_API_KEY is required")
         if not model:
             raise AgentClientError("PULSEFI_AGENT_MODEL is required")
-        self.api_key = api_key
-        self.model = model
-        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+        self.base_url = base_url.strip().rstrip("/")
         self.timeout_s = timeout_s
 
     @classmethod
-    def from_env(cls) -> "OpenAICompatibleClient":
+    def from_env(cls) -> "GroqClient":
         return cls(
-            api_key=os.environ.get("OPENAI_API_KEY", ""),
-            model=os.environ.get("PULSEFI_AGENT_MODEL", "gpt-4o-mini"),
+            api_key=os.environ.get("GROQ_API_KEY", ""),
+            model=os.environ.get(
+                "PULSEFI_AGENT_MODEL", "openai/gpt-oss-120b"
+            ),
             base_url=os.environ.get(
-                "PULSEFI_AGENT_BASE_URL", "https://api.openai.com/v1"
+                "PULSEFI_AGENT_BASE_URL",
+                "https://api.groq.com/openai/v1",
             ),
         )
 
-    def analyze(self, context: dict) -> AgentDecision:
+    def analyze(self, context: dict) -> AgentResponse:
         body = {
             "model": self.model,
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},
+            "reasoning_effort": "low",
+            "max_completion_tokens": 1000,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": DECISION_SCHEMA,
+            },
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -141,6 +318,8 @@ class OpenAICompatibleClient:
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "PulseFi-Agent/0.2",
             },
             method="POST",
         )
@@ -156,4 +335,22 @@ class OpenAICompatibleClient:
             content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise AgentClientError("Model API returned an unexpected response") from exc
-        return AgentDecision.from_dict(_extract_json(content))
+        decision = AgentDecision.from_dict(_extract_json(content))
+        _validate_grounded_evidence(decision, context)
+        usage = payload.get("usage") or {}
+        return AgentResponse(
+            decision=decision,
+            usage=AgentUsage(
+                prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                completion_tokens=int(usage.get("completion_tokens", 0)),
+                total_tokens=int(usage.get("total_tokens", 0)),
+                queue_time_s=_optional_float(usage.get("queue_time")),
+                total_time_s=_optional_float(usage.get("total_time")),
+            ),
+            request_id=_optional_string(
+                (payload.get("x_groq") or {}).get("id") or payload.get("id")
+            ),
+            system_fingerprint=_optional_string(
+                payload.get("system_fingerprint")
+            ),
+        )

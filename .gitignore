@@ -1,3 +1,7 @@
 /data
-/__pycache__
+__pycache__/
+*.py[cod]
+.DS_Store
+/docs
 /runtime
+/.env
